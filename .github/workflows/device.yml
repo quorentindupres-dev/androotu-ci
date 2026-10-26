@@ -1,0 +1,87 @@
+name: androotu-device
+on:
+  workflow_dispatch:
+jobs:
+  device:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: KVM
+        run: |
+          ls -l /dev/kvm || true
+          docker --version
+      - name: Boot androotu
+        run: |
+          docker pull ghcr.io/ahobsonsayers/androotu:latest
+          docker run -d --name androotu --device /dev/kvm --privileged \
+            -p 5555:5555 -v "$PWD/data:/data" -v "$PWD/extensions:/opt/scripts" \
+            ghcr.io/ahobsonsayers/androotu:latest
+          for i in $(seq 1 150); do
+            if docker logs androotu 2>&1 | grep -q "Success !!"; then break; fi
+            sleep 10
+          done
+          docker logs androotu 2>&1 | tail -100
+          docker logs androotu 2>&1 | grep -q "Success !!" || (echo "NO SUCCESS"; exit 1)
+      - name: ADB connect
+        run: |
+          docker run --rm --entrypoint cat androotu:latest /root/.android/adbkey > adbkey
+          sudo apt-get update -qq && sudo apt-get install -y -qq android-tools-adb
+          ADB_VENDOR_KEYS="$PWD/adbkey" adb connect localhost:5555
+          sleep 5
+          ADB_VENDOR_KEYS="$PWD/adbkey" adb devices
+      - name: Check verdict
+        env:
+          ADB_VENDOR_KEYS: ${{ github.workspace }}/adbkey
+        run: |
+          adb -s localhost:5555 shell 'am force-stop gr.nikolasspyr.integritycheck || true'
+          adb -s localhost:5555 shell 'am start -n gr.nikolasspyr.integritycheck/.MainActivity'
+          sleep 8
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            adb -s localhost:5555 shell uiautomator dump /sdcard/ui.xml >/dev/null 2>&1 || true
+            adb -s localhost:5555 pull /sdcard/ui.xml ui.xml >/dev/null 2>&1 || true
+            python3 - <<'PY'
+import xml.etree.ElementTree as ET, subprocess, time, re, json, sys
+def adb(*a): return subprocess.run(["adb","-s","localhost:5555",*a],capture_output=True,text=True).stdout
+def dump():
+    adb("shell","uiautomator","dump","/sdcard/ui.xml"); adb("pull","/sdcard/ui.xml","ui.xml")
+    try: return ET.parse("ui.xml").getroot()
+    except Exception: return None
+def tap_text(root, vals):
+    for n in root.iter("node"):
+        t=(n.get("text") or "").strip(); d=(n.get("content-desc") or "").strip()
+        if t in vals or d in vals:
+            m=re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", n.get("bounds") or "")
+            if m:
+                x=(int(m.group(1))+int(m.group(3)))//2; y=(int(m.group(2))+int(m.group(4)))//2
+                adb("shell","input","tap",str(x),str(y)); return True
+    return False
+r=dump()
+if r is None: print("no ui"); sys.exit(1)
+tap_text(r, {"CHECK","Make Play Integrity Request"})
+time.sleep(20)
+r=dump() or r
+tap_text(r, {"Show JSON response","Raw JSON","COPY JSON"})
+time.sleep(3)
+r=dump() or r
+for n in r.iter("node"):
+    t=(n.get("text") or "").strip()
+    if t.startswith("{") and "deviceIntegrity" in t:
+        print(t); open("verdict.json","w").write(t); sys.exit(0)
+print("NO JSON")
+for n in r.iter("node"):
+    t=(n.get("text") or "").strip()
+    if t: print(t[:200])
+sys.exit(2)
+PY
+            if [ -f verdict.json ]; then break; fi
+            sleep 8
+          done
+          cat verdict.json 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verdict
+          path: |
+            verdict.json
+            ui.xml
